@@ -1,0 +1,748 @@
+---
+title: "Project1"
+format: html
+editor: visual
+---
+
+## LA Dodgers Management Attendance Report
+
+### Introduction
+
+Our objective is to develop a model that can forecast attendance at Dodgers games. To do this, we shall begin with investigating variables. But first, let us download required libraries and load the data
+
+```{r, message=FALSE, warning=FALSE}
+library(magrittr)
+library(tidyverse)
+library(ggplot2)
+library(kableExtra)
+library(pander)
+library(car)
+library(knitr)
+library(ggmosaic)
+library(tidyr)
+library(dplyr)
+library(caret)
+library(stats)
+library(corrplot)
+library(MASS)
+library(GGally)
+library(glmnet)
+library(rstatix)
+library(boot)
+library(leaps)
+opts_chunk$set(echo = TRUE)
+
+options(knitr.kable.NA =".") 
+kable_format <- if (is_html_output()) "html" else "latex"
+options(scipen = 999)
+```
+
+Note that we need to factorize some variables and make necessary changes
+
+```{r, warning=FALSE, message=FALSE}
+ 
+library(RSQLite)
+con <- dbConnect(SQLite(), "./data/dodgers.sqlite") 
+
+data <- tbl(con, "events") %>% 
+        collect() %>% 
+        mutate(day_of_week = factor(day_of_week, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")),
+        month = factor(month, levels = c("APR","MAY","JUN","JUL","AUG","SEP","OCT"))) %>% 
+        mutate_if(is.character, factor) %>% 
+        mutate(temp = round((temp- 32)*5/9))
+
+data %>% summary()
+
+```
+
+### Part 1: Variable Inspection
+
+Let's see a general outlook
+
+```{r, message=FALSE}
+my_fn <- function(data, mapping, method="loess", ...){
+  p <- ggplot(data = data, mapping = mapping) +
+    geom_point() +
+    geom_smooth(method = method, se = FALSE, ...)  
+
+  return (p)
+}
+
+subset1 <- data[, c(3, 1, 2, 4, 5)]
+subset2 <- data[, c(3, 6, 7, 8, 9)]
+subset3 <- data[, c(3, 10, 11, 12)]
+
+
+ggpairs(subset1, progress = FALSE, cardinality_threshold = NULL,
+        upper = list(continuous = my_fn),  
+        lower = list(continuous = "cor"))
+
+ggpairs(subset2, progress = FALSE, cardinality_threshold = NULL,
+        upper = list(continuous = my_fn),  
+        lower = list(continuous = "cor"))
+
+ggpairs(subset3, progress = FALSE, cardinality_threshold = NULL,
+        upper = list(continuous = my_fn),  
+        lower = list(continuous = "cor"))
+```
+
+At the first glance, we notice that median of attendance at tuesday games and versus some opponents have higher than others. Shirts and bobbleheads seem to increased the attendance. Let's dive in to explore more
+
+```{r}
+ggplot(data, aes(day_of_week, attend, fill = day_of_week)) +
+  geom_boxplot(color = "black", alpha = 0.7) +
+  labs(x = "Day of Week", y = "Attendance", fill = "Day of Week") +
+  ggtitle("Attendance by Day of Week") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Based on the box plot, Tuesday games tend to draw larger crowds than Monday ones. Monday matches tend to draw less people.
+
+```{r}
+ggplot(data, aes(month, attend, fill = month)) +
+  geom_boxplot(color = "black", alpha = 0.7) +
+  labs(x = "Month", y = "Attendance", fill = "Month") +
+  ggtitle("Attendance by Month") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+```
+
+Summer months tend to draw more people, especially june.
+
+```{r}
+sum_attend <- data %>% 
+  group_by(day_of_week, bobblehead, day_night) %>% 
+  summarize(mean_attend = mean(attend),
+            total_attend = sum(attend), .groups = "drop")
+
+sum_attend %>% 
+  ggplot(aes(day_of_week, bobblehead, size = mean_attend, col = mean_attend)) +
+  geom_jitter(width = .1, height = .1, alpha = 0.7) +
+  scale_size(labels = scales::comma) +
+  scale_color_gradient(low = "blue", high = "red") +
+  labs(title = "Average attendance",
+       size = "attendance",
+       col = "attendance",
+       x = "Weekday",
+       y = "Bobblehead")
+```
+
+According to the average attendance graph above, matches with bobblehead prizes often have greater average attendance when compared across a particular workday. This suggests that bobblehead might be a helpful predictor that has a positive effect on attendance.
+
+```{r}
+data %>% 
+  count(day_of_week, month) %>% 
+  pivot_wider(names_from = day_of_week, values_from = n) %>% 
+  pander(caption = "Number of games played in each weekday and each month")
+
+xtabs(~ day_of_week + month, data = data) %>% chisq.test(simulate.p.value = TRUE, B = 10000)
+
+```
+
+Month and day of week of the game are unrelated.
+
+```{r}
+ggplot(data, aes(x = day_of_week)) +
+  geom_bar(aes(fill = factor(month)), width = 0.5, color = "black") + 
+  labs(title = "Bar Plot of Day of Week by Month", x = "Day of Week", y = "Count", fill = "Month") +  
+  theme_minimal() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Games are played almost equally except "Thursday" in months
+
+```{r}
+xtabs_data <- xtabs(attend ~ day_of_week + month, data)
+
+heatmap(xtabs_data,
+        Colv = NA, Rowv = NA,        
+        col = heat.colors(50),       
+        margins = c(5, 5),           
+        xlab = "Month", 
+        main = "Attendance Heatmap"  
+)
+```
+
+In the heat map, the colors change from red and yellow as attendance increases. Here we see that may, july, and august has higher attendance rates than other months. Similarly, friday, saturday, and sunday has higher attendance numbers than other days.
+
+```{r}
+sum_attend <- data %>% 
+  group_by(day_of_week, month, bobblehead) %>% 
+  summarize(mean_attend = mean(attend),
+            total_attend = sum(attend), .groups = "drop")
+
+sum_attend %>% 
+  ggplot(aes(day_of_week, month, bobblehead)) +
+  geom_jitter(aes(size = mean_attend, col=bobblehead), width = .1, height = .1, alpha=0.7) +
+  scale_size(labels = scales::comma) +
+  labs(title = "Average Attendance by Bobblehead",
+       size = "Attendance",
+       color = "Bobblehead",
+       shape = "Bobblehead",
+       x = "Weekday",
+       y = "Month") +
+  theme_minimal()
+```
+
+It can be observed that bobblehead promotion increases the attendance. We can clearly see that effect for saturday matches in april, tuesday and sunday matches in july.
+
+```{r}
+skies_days <- data %>% 
+  group_by(day_of_week, skies) %>% 
+  summarise(count = n(), .groups = "drop")
+
+ggplot(skies_days, aes(x = day_of_week, y = count, fill = skies)) + 
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Weekday", y = "Count", fill = "Sky Condition") +
+  ggtitle("Sky Condition vs Weekday") +
+  scale_fill_manual(values = c("Clear" = "#66c2a5", "Cloudy" = "#fc8d62", "Rainy" = "#8da0cb")) + 
+  theme_minimal() +
+  geom_text(aes(label = count), position = position_dodge(width = 0.9), vjust = -0.5)   
+```
+
+We discover that practically every day_of_week is dominated by clear sky conditions, which means that the majority of the time the games were played, the skies were clear.
+
+```{r}
+skies_months <- data %>% 
+  group_by(month, skies) %>% 
+  summarise(count = n(), .groups = "drop")
+
+ggplot(skies_months, aes(x = month, y = count, fill = skies)) + 
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Month", y = "Count", fill = "Sky Condition") +
+  ggtitle("Sky Condition vs Month") +
+  scale_fill_manual(values = c("Clear" = "#66c2a5", "Cloudy" = "#fc8d62", "Rainy" = "#8da0cb")) +  
+  theme_minimal() +
+  geom_text(aes(label = count), position = position_dodge(width = 0.9), vjust = -0.5) 
+```
+
+Again, in months, most of the plays are played in clear skies similarly previous chart.
+
+```{r}
+sum_skies <- data %>% 
+  group_by(month, skies) %>% 
+  summarize(mean_attend = mean(attend),
+            total_attend = sum(attend), .groups = "drop")
+
+ggplot(sum_skies, aes(x = month, y = mean_attend, color = skies)) +
+  geom_point(size = 3, aes(shape = skies)) +
+  scale_shape_manual(values = c(15, 17, 19)) +  
+  labs(title = "Average Attendance by Sky Condition and Month",
+       x = "Month", y = "Mean Attendance", color = "Sky Condition", shape = "Sky Condition") +
+  theme_minimal()
+```
+
+We see that in june and august, cloudy day games have higher attendance than clear day games. It can be caused of the high temperatures. In summer months, people tend to go to games when weather is cloudy and temperature is low. To check the effect, we can apply t-test in order to check if the variable is statistically significant.
+
+```{r}
+t.test(x=data$attend[data$skies=="Clear"],
+       y=data$attend[data$skies=="Cloudy"])
+```
+
+As the t-test's p-value is 0.20 \> 0.05, there is no statistically significance between attendance and clear or cloudy sky. Let's check shirts
+
+```{r}
+ggplot(data, aes(shirt, attend, fill = shirt)) +
+  geom_boxplot(color = "black", alpha = 0.7) +
+  labs(x = "Shirt Color", y = "Attendance", fill = "Shirt Given") +
+  ggtitle("Attendance by Shirt Given") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The shirt may have some impact on the attendance since its median value is higher than the other. But we need to check more about that.
+
+```{r}
+shirts <- sum(data$shirt == "YES")
+noshirts <- sum(data$shirt == "NO")
+
+pie_data <- data.frame(
+  labels = c("With Shirts", "Without Shirts"),
+  values = c(shirts, noshirts)
+)
+
+ggplot(pie_data, aes(x = "", y = values, fill = labels)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = paste0(values, " (", round(values/sum(values)*100), "%)")), position = position_stack(vjust = 0.5)) +
+  labs(title = "Distribution of Games with/without Shirts",
+       caption = paste("With Shirts:", shirts,
+                       "\nWithout Shirts:", noshirts)) +
+  theme_void() +
+  scale_fill_manual(values = c("With Shirts" = "#66c2a5", "Without Shirts" = "#fc8d62")) +
+  guides(fill = guide_legend(title = NULL))
+```
+
+Three games out of 81 had shirts distributed to the fans. Let's check t.test
+
+```{r}
+t.test(x=data$attend[data$shirt=="NO"],
+       y=data$attend[data$shirt=="YES"])
+```
+
+As the t-test's p-value is 0.189 \> 0.05, there is no statistically significance between attendance and whether shirt is given or not. Let's check fireworks
+
+```{r}
+ggplot(data, aes(fireworks, attend, fill = fireworks)) +
+  geom_boxplot(color = "black", alpha = 0.7) +
+  labs(x = "Fireworks", y = "Attendance", fill = "Fireworks") +
+  ggtitle("Attendance by Fireworks") +
+  theme_minimal()
+```
+
+A closer glance at our graph reveals that the boxplot medians and ranges are distributed similarly, pointing to a less significant effect on attendance.
+
+```{r}
+fireworks_group <- data %>% 
+  group_by(day_of_week, fireworks) %>% 
+  summarise(count = n(), .groups = "drop")
+
+ggplot(fireworks_group, aes(x = day_of_week, y = count, fill = fireworks)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Day of Week", y = "Count", fill = "Sky") +
+  ggtitle("Fireworks by Day of Week") +
+  theme_minimal()
+```
+
+We notice that Fridays were when almost majority of the fireworks were used. Check with t-test.
+
+```{r}
+t.test(x=data$attend[data$fireworks=="NO"],
+       y=data$attend[data$fireworks=="YES"])
+```
+
+As the t-test's p-value is 0.98 \> 0.05, there is no statistically significance between attendance and firework. Let's look caps
+
+```{r}
+ggplot(data, aes(cap, attend, fill = cap)) +
+  geom_boxplot(color = "black", alpha = 0.7) +
+  labs(x = "Cap", y = "Attendance", fill = "Cap") +
+  ggtitle("Attendance by Cap") +
+  theme_minimal()
+```
+
+A closer glance at our graph reveals that the boxplot medians and ranges are distributed similarly, pointing to a less significant effect on attendance.
+
+```{r}
+cap <- sum(data$cap == "YES")
+nocap <- sum(data$cap == "NO")
+
+pie_data <- data.frame(
+  labels = c("With Caps", "Without Caps"),
+  values = c(cap, nocap)
+)
+
+ggplot(pie_data, aes(x = "", y = values, fill = labels)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  geom_text(aes(label = paste0(values, " (", round(values/sum(values)*100), "%)")), position = position_stack(vjust = 0.5)) +
+  labs(title = "Distribution of Games with/without Caps",
+       caption = paste("With Caps:", cap,
+                       "\nWithout Caps:", nocap)) +
+  theme_void() +
+  scale_fill_manual(values = c("With Caps" = "#66c2a5", "Without Caps" = "#fc8d62")) +
+  guides(fill = guide_legend(title = NULL))
+```
+
+Just as with the t-shirt, hats were distributed in just two games. Let's look t-test
+
+```{r}
+t.test(x=data$attend[data$cap=="NO"],
+       y=data$attend[data$cap=="YES"])
+```
+
+As the t-test's p-value is 0.66 \> 0.05, there is no statistically significance between attendance and caps. Let's look Opponents which might be a very useful predictor.
+
+```{r}
+ggplot(data, aes(x=attend/1000, y=opponent, color=day_night)) +
+geom_point() +
+ggtitle("Dodgers Attendance By Opponent") +
+theme(plot.title = element_text(lineheight=3, face="bold")) +
+xlab("Attendance (Thousands)") +
+ylab("Opponent")
+```
+
+Clearly, people wanted to watch some certain teams on stadium.
+
+```{r}
+data$opponent_initials <- str_sub(data$opponent, 1, 3)
+
+ops_summary <- data %>%
+  group_by(opponent_initials) %>%
+  summarise(average_attendance = mean(attend))
+
+ops_summary$opponent_initials <- factor(ops_summary$opponent_initials, levels = ops_summary$opponent_initials[order(ops_summary$average_attendance)])
+
+ggplot(ops_summary, aes(x = opponent_initials, y = average_attendance)) +
+  geom_bar(stat = "identity", fill = "#66c2a5") +
+  geom_text(aes(label = round(average_attendance)), vjust = -0.35, color = "black", size = 3) + 
+  labs(title = "Average Attendance by Opponent",
+       x = "Opponent",
+       y = "Average Attendance") +
+  theme_minimal()
+```
+
+It is clear that certain teams have greater average attendance figures than others.
+
+Let's check interactions:
+
+```{r}
+data$opponent_initials <- str_sub(data$opponent, 1, 3)
+
+ggplot(data, aes(x=opponent_initials, y=temp, fill=attend)) +
+  geom_tile() +
+  labs(title="Heatmap: Attendance by Temperature and Opponent Team", x="Opponent Team", y="Temperature", fill="Attendance") +
+  scale_fill_gradient(low="lightblue", high="darkblue") +
+  theme_minimal()
+
+ggplot(data, aes(x=opponent_initials, y=month, fill=attend)) +
+  geom_tile() +
+  labs(title="Heatmap: Attendance by Month and Opponent Team", x="Opponent Team", y="Month", fill="Attendance") +
+  scale_fill_gradient(low="lightblue", high="darkblue") +
+  theme_minimal()
+
+ggplot(data, aes(x=opponent_initials, y=day_of_week, fill=attend)) +
+  geom_tile() +
+  labs(title="Heatmap: Attendance by Day of Week and Opponent Team", x="Opponent Team", y="Day of Week", fill="Attendance") +
+  scale_fill_gradient(low="lightblue", high="darkblue") +
+  theme_minimal()
+```
+
+Most attendance is caught around 20-25 degrees and summer months. Teams differ greatly when they play games. Some clubs didn't even have weekend games. Furthermore, it appears that, in comparison to other teams, some of the teams are drawing denser attendance on comparable days. As such, we are able to determine whether the opponent type varies with the day. We can check the interactions between days and opponents:
+
+```{r, warning=FALSE}
+data$day_of_week <- as.character(data$day_of_week)
+data$opponent <- as.character(data$opponent)
+
+data$day_of_week <- factor(data$day_of_week, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))
+
+ggplot(data, aes(x = day_of_week, y = attend, color = opponent, group = opponent)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Interaction Plot of Attendance by Day of Week and Opponent",
+       x = "Day of Week", y = "Attendance", color = "Opponent") +
+  theme_minimal()
+
+```
+
+We can see that lines are not parallel and intersecting with each other. That points out there may be an interaction between opponents and day of week. Let's check day_night
+
+```{r}
+sum_attend <- data %>% 
+  group_by(day_of_week, month, day_night) %>% 
+  summarize(mean_attend = mean(attend),
+            total_attend = sum(attend), .groups = "drop")
+
+ggplot(sum_attend, aes(x = day_of_week, y = month, size = mean_attend, color = day_night)) +
+  geom_jitter(width = .1, height = .1, alpha = 0.7) +
+  scale_size_continuous(labels = scales::comma) +
+  labs(title = "Average Attendance by Weekday and Month",
+       size = "Attendance", color = "Part of Day",
+       x = "Weekday", y = "Month") +
+  theme_minimal()
+```
+
+We see that night games have higher attendance than day games. Also, day games are usually played at sundays. Let's check the interaction with temperature.
+
+```{r}
+ggplot(data, aes(x = day_night, y = temp, fill = day_night)) +
+  geom_boxplot() +
+  labs(title = "Distribution of Temperature by Part of Day",
+       x = "Part of Day", y = "Temperature") +
+  theme_minimal()
+```
+
+We see from boxplot, temperatures are generally low at night games compared to day games with one outlier.
+
+```{r}
+ggplot(data, aes(x=temp, y=attend/1000, color=fireworks)) +
+geom_point() +
+facet_wrap(day_night~skies) +
+ggtitle("Dodgers Attendance By Temperature By Time of Game and Skies") +
+theme(plot.title = element_text(lineheight=3, face="bold")) +
+xlab("Temperature") +
+ylab("Attendance (Thousands)")
+```
+
+We see that fireworks are used in night matches and used more often when sky is clear but cannot tell whether it affected attendance.
+
+```{r, message=FALSE}
+ggplot(data, aes(x = temp, y = attend)) +
+  geom_point() +
+  labs(title = "Scatter Plot of Temperature vs Attendance",
+       x = "Temperature", y = "Attendance") +
+  geom_smooth(se=FALSE) +
+  theme_minimal()
+```
+
+Temperature might be an useful predictor since at the low and high temperatures attendees may not prefer to go stadium and prefer watching the game at their homes. Let's check day of month. First guess is it won't be a useful predictor since there is not any logical explanation with the attendance.
+
+```{r}
+day_summary <- data %>%
+  group_by(day) %>%
+  summarise(average_attendance = mean(attend))
+
+ggplot(day_summary, aes(x = day, y = average_attendance)) +
+  geom_bar(stat = "identity", fill = "orange") +
+  geom_text(aes(label = round(average_attendance)), vjust = -0.35, color = "black", size = 2) + 
+  labs(title = "Average Attendance by Day of the Month",
+       x = "Day of the Month",
+       y = "Average Attendance") +
+  theme_minimal()
+```
+
+It seems uniformly distributed with some exceptions. To determine it, lets make linear regression:
+
+```{r}
+day_lm <- lm(attend ~ day, data = data)
+day_lm %>% summary()
+```
+
+Day appears to be a bad predictor of attendance, as indicated by the negative adjusted R-Squared value and high p-value. As such, we will not include it in our analysis.
+
+### Part 2: Regression Analysis
+
+Let's start with a model from the insights we gained from variable inspection.
+
+```{r}
+lm1 <- lm(attend ~ . -day -opponent_initials, data = data)
+lm1 %>% summary()
+```
+
+From the data analysis part, we see that some opponents have similar average attendance values. We can group them for better explanation. Also, we can group months based on seasons.
+
+```{r}
+data$opponent %>% table()
+```
+
+```{r}
+data$month %>% table()
+```
+
+```{r}
+data2 <- data %>% 
+  mutate( opponent = fct_collapse(opponent,
+             `<38k` = c("Braves", "Astros", "Brewers", "Pirates"),
+             `38k-41k` = c("Giants", "Snakes", "Rockies", "Reds", "Cardinals", "Marlins"),
+             `41k-46k`= c("Phillies", "Padres", "Cubs", "White Sox"),
+             `>49k` = c("Nationals", "Mets", "Angels")),
+          month = fct_collapse(month,
+              `Spring` = c("APR", "MAY"),
+              `Summer` = c("JUN", "JUL", "AUG"),
+              `Fall`= c("SEP",  "OCT"))
+          )
+
+```
+
+```{r}
+lm2 <- lm(attend ~ . -day -opponent_initials, data = data2)
+lm2 %>% summary()
+```
+
+```{r, warning=FALSE}
+lm2 %>% plot()
+```
+
+```{r}
+influencePlot(lm2)
+```
+
+There doesn't seem any influencial point. One thing we can still try is to firstly remove insignificant predictors in the main model using step(), and then add the interactions of the remaining predictors, and use step() again to get rid of uninteresting variables.
+
+```{r}
+lm3 <- lm2 %>% 
+  update(. ~ . +  month*day_of_week + opponent*month + day_of_week*opponent +day_of_week*bobblehead) %>% 
+  step(trace=FALSE)
+lm3 %>% summary()
+
+```
+
+Let's try if we can increase the adjusted R\^2 by adding temperature in a different way since temp is not a linear variable (very high and low temperature have bad affect while middle temperatures have high attendance) we can try to add it in a different way
+
+```{r}
+data_summary <- data2 %>%
+  group_by(temp) %>%  
+  summarize(avg_attendance = mean(attend)) %>% 
+  arrange(desc(avg_attendance)) %>% 
+  head(1) 
+
+temp_with_highest_attendance <- data_summary$temp
+```
+
+By looking at the optimum points and the graph we drew above temp x attendance lets say between 20 and 27 attendance is good
+
+```{r}
+std <- sd(data2$temp)
+
+data3 <- mutate(data2, temp = ifelse(data2$temp <20| data2$temp > 27, "Bad", "Good"))
+
+
+data4 <- mutate(data3,
+                          factor(temp))
+```
+
+```{r}
+ggplot(data4, aes(temp, attend, fill = temp)) +
+  geom_boxplot(color = "black", alpha = 0.7) +
+  labs(x = "temp", y = "Attendance", fill = "Temperature") +
+  ggtitle("Attendance by good or bad temperature") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+by the boxplot we observe that there might be a correlation since mean of attendance seems to be higher in good weather
+
+```{r}
+lm4 <- lm(formula = attend ~ month + day_of_week + opponent + skies + temp +
+    day_night + cap + shirt + fireworks + bobblehead + month:day_of_week +
+    month:opponent + day_of_week:opponent, data = data4)
+summary(lm4)
+```
+
+we can see that r\^2 did not increase maybe we can try R\^2
+
+```{r}
+lm4 <- lm(formula = attend ~ month + day_of_week + opponent + skies + I(temp)^2 +
+    day_night + cap + shirt + fireworks + bobblehead + month:day_of_week +
+    month:opponent + day_of_week:opponent, data = data2)
+summary(lm4)
+```
+
+since this also did not work we can go on with lm3 which is a better fit for the model let's look at the plot of lm3 Adjusted R-squared is to assess the goodness-of-fit of a linear regression model.
+
+Adjusted R\^2 represents the proportion of variance in the dependent variable explained by the model. Right now we find it to be 0.677 meaning our model explains %67.7 of the variance in attendance can be exlained by our model
+
+```{r}
+lm3 %>% plot()
+```
+
+-Residuals vs Fitted- plot helps you identify patterns or trends in the residuals, which can indicate violations of the linearity assumption.
+
+-QQ Residuals- plot helps you assess the normality of the residuals. If the points fall along a straight line, it suggests that the residuals are normally distributed.
+
+-Scale-Location- plot helps you check for homoscedasticity (constant variance of residuals). A horizontal line in the plot indicates constant variance.
+
+From what we can observe 13, 26, and 19 are points that we can consider looking but omitting them could lead to overfitting so lets leave them
+
+-Residuals vs Leverage- plot helps you identify influential observations. Points that are high on the y-axis and have high leverage may have a large impact on the regression model. Examining the influence of each observation on the regression model. Cook's distance measures how much the predicted values would change if a particular observation is excluded. High Cook's distances indicate influential observations. since there aren't any points with cook's distance over 0.5 we are good
+
+```{r}
+shapiro.test(rstudent(lm3))
+```
+
+We used shapiro.test(), which tests the null hypothesis that the sampled values were drawn from a normal distribution versus the alternative that the population is not normally distributed; the test is based essentially on the square of the correlation between the x and y coordinates of the points in the normal QQ-plot. Since p-value is  less than 0.05, indicating that this model's residuals may not be normally distributed. As a result, we draw the conclusion that this linear model is unsatisfactory.
+
+```{r}
+ncvTest(lm3)
+```
+
+We used ncvTest test where the null hypothesis that the residuals have constant variance against the alternative hypothesis that the variance of the residuals is a function of the fitted values. Since p-value is less than 0.05, conclude that there is evidence of non-constant variance.
+
+Let's look whether temp is a good predictor to our model
+
+```{r}
+anova(update(lm3, . ~ . + temp), lm3)
+AIC(update(lm3, . ~ . + temp), lm3)
+```
+
+It turns out that it is not. Let's check can we make our model more simplified
+
+```{r}
+anova(update(lm3, . ~ . - day_night), lm3)
+AIC(update(lm3, . ~ . - day_night), lm3)
+```
+
+We can remove day_night from our model to get a more simplified model. Let's continue.
+
+```{r}
+lm3 <- update(lm3, . ~ . - day_night)
+anova(update(lm3, . ~ . - fireworks), lm3)
+AIC(update(lm3, . ~ . - fireworks), lm3)
+```
+
+Fireworks seems to be an important predictor for us.
+
+```{r}
+anova(update(lm3, . ~ . - bobblehead), lm3)
+AIC(update(lm3, . ~ . - bobblehead), lm3)
+```
+
+Bobblehead seems to be an important predictor for us as well.
+
+```{r}
+lm3 %>% summary()
+```
+
+```{r}
+lm3 %>% plot()
+```
+
+diagnostic plots seem better, there are a lot of data points with leverage one. Let's apply boxcox transformation to see whether it requires a transformation.
+
+```{r}
+bc <- boxcox(lm3, lambda = seq(-4,4))
+best.lam <- bc$x[which(bc$y==max(bc$y))]
+best.lam
+```
+
+The Box-Cox transformation is a power transformation that eliminates nonlinearity between variables. Best lambda value turns out to be as 1.5.
+
+```{r}
+lm5 <- lm(formula = (attend)^1.5 ~ month + day_of_week + opponent + skies + 
+    cap + shirt + fireworks + bobblehead + month:day_of_week + 
+    month:opponent + day_of_week:opponent, data = data2)
+lm5 %>% summary()
+lm5 %>% plot()
+```
+
+Here we see that our adj r\^2 increased.
+
+```{r}
+ncvTest(lm5)
+shapiro.test(rstudent(lm5))
+```
+
+both test results are parallel with the assumptions of linear model.
+
+based on the Shapiro-Wilk test result p is greater than 0.05 we fail to reject null hypothesis we cannot conclude that the residuals of our model are not normally distributed
+
+p is greater than 0.05 we fail to reject null hypothesis so for ncvTest result we can conclude that residuals have constant variance ( we can not accept non constant variance )
+
+As a result, our final model (lm5) did a great job at diagnostics and aligned with the assumptions of linear model with adjusted R\^2 of 0.69.
+
+Here below for the appendix are some trials that did not really work :)
+
+```{r}
+
+# regfit.fwd <- regsubsets(attend ~ month + day_of_week + opponent + skies + 
+#     cap + shirt + fireworks + bobblehead + month:day_of_week + 
+#     month:opponent + day_of_week:opponent, data = data2, method = "forward",nvmax = 10)
+# (regfit.fwd %>% summary)$bic %>% which.min
+# (regfit.fwd %>% summary)$adj %>% which.max
+# (regfit.fwd %>% summary)$cp %>% which.min
+# summary.fwd <- regfit.fwd %>% summary
+```
+
+```{r}
+# set.seed(1)
+# 
+# x <- model.matrix(attend ~ month + day_of_week + opponent + skies +  
+#                   cap + shirt + fireworks + bobblehead + 
+#                   month:day_of_week + month:opponent + day_of_week:opponent,
+#                   data2)[,-1]
+# y <- data2$attend
+# train <- sample(1:nrow(x), nrow(x)/2)
+# test <- (-train)
+# y.test <- y[test]
+# 
+# 
+# lambda.grid <- seq(0, 1, length=100)
+# ridge.mod <- glmnet(x[train,],y[train], alpha=0.1, lambda=lambda.grid)
+# 
+# ridge.pred <- predict(ridge.mod, s=1, newx=x[test,])  
+# 
+# mean((ridge.pred - y.test)^2)
+# 1 - (nrow(data2) - 1) * MSE / sum((y.test - mean(y.test))^2)
+
+```
